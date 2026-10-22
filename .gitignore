@@ -1,0 +1,10 @@
+# Runtime and generated output
+.env
+.env.*
+!.env.example
+**/bin/
+*.test
+*.pprof
+coverage.out
+.DS_Store
+.idea/
