@@ -100,13 +100,15 @@ type Producer struct {
 	client KafkaClient
 	logger *slog.Logger
 
-	submitted atomic.Uint64
-	acked     atomic.Uint64
-	failed    atomic.Uint64
-	closed    atomic.Bool
+	mu        sync.Mutex
+	submitted uint64
+	acked     uint64
+	failed    uint64
+	closed    bool
 }
 
-// New creates a new Producer with validated configuration.
+// New creates a single-run Producer. Run takes exclusive ownership of client
+// and closes it before returning; callers must not share it with other workloads.
 func New(cfg Config, client KafkaClient, logger *slog.Logger) (*Producer, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, err
@@ -134,16 +136,23 @@ func New(cfg Config, client KafkaClient, logger *slog.Logger) (*Producer, error)
 type batchSlot struct {
 	buf     []byte
 	records []kgo.Record
-	wg      sync.WaitGroup
+	pending atomic.Int64
+	done    chan struct{}
 	active  bool
 }
 
 // Run executes the generation loop until ctx is canceled (or duration expires),
 // then performs a bounded drain.
-// Total shutdown and cleanup time is strictly bounded by DrainTimeout.
+// DrainTimeout bounds acknowledgement waiting. Client.Close then releases transport
+// resources; its teardown time is additional and is not context-bounded by kgo.
 func (p *Producer) Run(ctx context.Context) (*Summary, error) {
+	defer p.client.Close()
 	genCtx, genCancel := context.WithTimeout(ctx, p.cfg.Duration)
 	defer genCancel()
+	// Delivery may continue after generation stops, but blocked client admission
+	// still has a deadline. Close terminates unresolved transport work on exit.
+	deliveryCtx, deliveryCancel := context.WithTimeout(context.Background(), p.cfg.Duration+p.cfg.DrainTimeout)
+	defer deliveryCancel()
 
 	p.logger.Info("starting producer workload",
 		"run_id", fmt.Sprintf("%x", p.cfg.RunID),
@@ -179,13 +188,9 @@ func (p *Producer) Run(ctx context.Context) (*Summary, error) {
 		if !slot.active {
 			return nil
 		}
-		done := make(chan struct{})
-		go func() {
-			slot.wg.Wait()
-			close(done)
-		}()
+
 		select {
-		case <-done:
+		case <-slot.done:
 			slot.active = false
 			return nil
 		case <-ctx.Done():
@@ -245,27 +250,35 @@ loop:
 		}
 
 		// Submit batch to Kafka
-		slot.wg.Add(batchCount)
+		slot.pending.Store(int64(batchCount))
+		slot.done = make(chan struct{})
 		slot.active = true
 
 		for i := 0; i < batchCount; i++ {
 			rec := &slot.records[i]
-			p.submitted.Add(1)
+			p.mu.Lock()
+			p.submitted++
+			p.mu.Unlock()
 
-			// Use background context for delivery so submitted writes can complete during drain.
-			// Drain enforces its own bounded timeout (p.cfg.DrainTimeout) over in-flight writes and Flush.
-			p.client.Produce(context.Background(), rec, func(r *kgo.Record, err error) {
-				defer slot.wg.Done()
+			// Keep accepted records alive through the dedicated drain window.
+			p.client.Produce(deliveryCtx, rec, func(r *kgo.Record, err error) {
+				defer func() {
+					if slot.pending.Add(-1) == 0 {
+						close(slot.done)
+					}
+				}()
+				p.mu.Lock()
+				defer p.mu.Unlock()
 				// Only update live counters while the producer run is active.
 				// Callbacks arriving after timeout shutdown must not mutate closed run counters.
-				if p.closed.Load() {
+				if p.closed {
 					return
 				}
 				if err != nil {
-					p.failed.Add(1)
+					p.failed++
 					batchFailed.Store(true)
 				} else {
-					p.acked.Add(1)
+					p.acked++
 				}
 			})
 		}
@@ -291,35 +304,30 @@ loop:
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), p.cfg.DrainTimeout)
 	defer drainCancel()
 
-	// Wait for all active batch slots to complete or until drainCtx expires
-	slotsDone := make(chan struct{})
-	go func() {
-		for i := range slots {
-			if slots[i].active {
-				slots[i].wg.Wait()
-			}
-		}
-		close(slotsDone)
-	}()
-
+	// Observe callback-owned completion channels directly: no waiter goroutines
+	// survive a timeout, and slot storage remains owned by pending callbacks.
 	var drainErr error
-	select {
-	case <-slotsDone:
-		// In-flight batch callbacks completed, now flush any remaining client buffers
+	for i := range slots {
+		if err := waitSlot(drainCtx, &slots[i]); err != nil {
+			drainErr = fmt.Errorf("producer: drain timed out waiting for in-flight completions: %w", err)
+			break
+		}
+	}
+	if drainErr == nil {
 		drainErr = p.client.Flush(drainCtx)
-	case <-drainCtx.Done():
-		drainErr = fmt.Errorf("producer: drain timed out waiting for in-flight completions: %w", drainCtx.Err())
 	}
 
 	drainElapsed := time.Since(drainStart)
 	totalElapsed := time.Since(genStart)
 
 	// Mark producer run as closed to freeze live counter mutation by any late callbacks
-	p.closed.Store(true)
+	p.mu.Lock()
+	p.closed = true
 
-	submittedTotal := p.submitted.Load()
-	ackedTotal := p.acked.Load()
-	failedObserved := p.failed.Load()
+	submittedTotal := p.submitted
+	ackedTotal := p.acked
+	failedObserved := p.failed
+	p.mu.Unlock()
 
 	// Unconfirmed writes are those submitted but not confirmed acknowledged or failed at timeout
 	var unconfirmedTotal uint64

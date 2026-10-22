@@ -81,3 +81,7 @@ Throughput (avg): 4978.59 records/sec (across 10.043s total window)
 4. Verify normal operation, partial failures, crash/restart, and uncertain outcomes against real dependencies.
 5. Record a reproducible performance baseline.
 6. Introduce batching and bounded concurrency only where measured bottlenecks justify them, preserving correctness checks.
+
+### Producer shutdown
+
+`Run` owns its dedicated Kafka client and closes it before returning. Generation stops at the requested duration or signal; `-drain-timeout` bounds acknowledgement waiting, after which unresolved writes are reported as failed/unconfirmed, not proven absent from Kafka. Client transport teardown follows separately and is not covered by that deadline. Reported run/drain timings exclude client teardown. Batch completion is signalled by callbacks directly; timeout does not leave application waiter goroutines behind.

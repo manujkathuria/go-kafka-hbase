@@ -16,6 +16,10 @@ import (
 )
 
 func main() {
+	os.Exit(run())
+}
+
+func run() int {
 	var (
 		brokersFlag = flag.String("brokers", "localhost:9092", "Comma-separated list of Kafka broker addresses")
 		topicFlag   = flag.String("topic", "", "Target Kafka topic (required, must exist)")
@@ -33,7 +37,7 @@ func main() {
 	if strings.TrimSpace(*topicFlag) == "" {
 		fmt.Fprintf(os.Stderr, "Error: -topic flag is required\n\nUsage:\n")
 		flag.PrintDefaults()
-		os.Exit(2)
+		return 2
 	}
 
 	brokerAddrs := strings.Split(*brokersFlag, ",")
@@ -51,7 +55,7 @@ func main() {
 
 	if err := cfg.Validate(); err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
-		os.Exit(2)
+		return 2
 	}
 
 	// Initialize franz-go client with reliable settings:
@@ -68,16 +72,21 @@ func main() {
 	)
 	if err != nil {
 		logger.Error("failed to initialize Kafka client", "error", err)
-		os.Exit(1)
+		return 1
 	}
-	defer client.Close()
+	commandOwnsClient := true
+	defer func() {
+		if commandOwnsClient {
+			client.Close()
+		}
+	}()
 
 	// Verify broker connectivity before generating work
 	ctxPing, cancelPing := context.WithTimeout(context.Background(), 5*time.Second)
 	if err := client.Ping(ctxPing); err != nil {
 		cancelPing()
 		logger.Error("failed to connect to Kafka brokers", "brokers", cfg.Brokers, "error", err)
-		os.Exit(1)
+		return 1
 	}
 	cancelPing()
 
@@ -88,9 +97,11 @@ func main() {
 	prod, err := producer.New(cfg, client, logger)
 	if err != nil {
 		logger.Error("failed to create producer", "error", err)
-		os.Exit(1)
+		return 1
 	}
 
+	// Transfer exclusive cleanup ownership to Run.
+	commandOwnsClient = false
 	summary, runErr := prod.Run(ctx)
 	if summary != nil {
 		summary.Print(os.Stdout)
@@ -98,6 +109,7 @@ func main() {
 
 	if runErr != nil {
 		logger.Error("producer finished with error", "error", runErr)
-		os.Exit(1)
+		return 1
 	}
+	return 0
 }
