@@ -103,6 +103,7 @@ type Producer struct {
 	submitted atomic.Uint64
 	acked     atomic.Uint64
 	failed    atomic.Uint64
+	closed    atomic.Bool
 }
 
 // New creates a new Producer with validated configuration.
@@ -135,7 +136,6 @@ type batchSlot struct {
 	records []kgo.Record
 	wg      sync.WaitGroup
 	active  bool
-	done    chan struct{}
 }
 
 // Run executes the generation loop until ctx is canceled (or duration expires),
@@ -174,6 +174,25 @@ func (p *Producer) Run(ctx context.Context) (*Summary, error) {
 	var seq uint64
 	slotIdx := 0
 
+	// Helper to wait for a slot's completion with context awareness
+	waitSlot := func(ctx context.Context, slot *batchSlot) error {
+		if !slot.active {
+			return nil
+		}
+		done := make(chan struct{})
+		go func() {
+			slot.wg.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			slot.active = false
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
 loop:
 	for {
 		select {
@@ -184,14 +203,10 @@ loop:
 
 		slot := &slots[slotIdx]
 		// If this slot was previously submitted, wait for its completion before reusing its buffer.
-		// Crucial: this wait MUST respect genCtx. If Kafka stalls or stops completing writes,
-		// we must not hang forever here—we must exit generation and enter bounded drain.
+		// Crucial: this wait respects genCtx. If Kafka stalls or stops completing writes,
+		// we exit generation and proceed to the bounded drain phase.
 		if slot.active {
-			select {
-			case <-slot.done:
-				slot.active = false
-			case <-genCtx.Done():
-				// Generation canceled or deadline expired while waiting for slot reuse
+			if err := waitSlot(genCtx, slot); err != nil {
 				break loop
 			}
 		}
@@ -231,14 +246,7 @@ loop:
 
 		// Submit batch to Kafka
 		slot.wg.Add(batchCount)
-		slot.done = make(chan struct{})
 		slot.active = true
-
-		// Spawn a single waiter to close slot.done when this batch finishes
-		go func(s *batchSlot) {
-			s.wg.Wait()
-			close(s.done)
-		}(slot)
 
 		for i := 0; i < batchCount; i++ {
 			rec := &slot.records[i]
@@ -248,6 +256,11 @@ loop:
 			// Drain enforces its own bounded timeout (p.cfg.DrainTimeout) over in-flight writes and Flush.
 			p.client.Produce(context.Background(), rec, func(r *kgo.Record, err error) {
 				defer slot.wg.Done()
+				// Only update live counters while the producer run is active.
+				// Callbacks arriving after timeout shutdown must not mutate closed run counters.
+				if p.closed.Load() {
+					return
+				}
 				if err != nil {
 					p.failed.Add(1)
 					batchFailed.Store(true)
@@ -283,7 +296,7 @@ loop:
 	go func() {
 		for i := range slots {
 			if slots[i].active {
-				<-slots[i].done
+				slots[i].wg.Wait()
 			}
 		}
 		close(slotsDone)
@@ -301,21 +314,25 @@ loop:
 	drainElapsed := time.Since(drainStart)
 	totalElapsed := time.Since(genStart)
 
+	// Mark producer run as closed to freeze live counter mutation by any late callbacks
+	p.closed.Store(true)
+
 	submittedTotal := p.submitted.Load()
 	ackedTotal := p.acked.Load()
-	failedTotal := p.failed.Load()
-	// Unconfirmed writes are those submitted but neither explicitly acknowledged nor failed
-	if ackedTotal+failedTotal < submittedTotal {
-		unconfirmed := submittedTotal - (ackedTotal + failedTotal)
-		p.failed.Add(unconfirmed)
-		failedTotal = p.failed.Load()
+	failedObserved := p.failed.Load()
+
+	// Unconfirmed writes are those submitted but not confirmed acknowledged or failed at timeout
+	var unconfirmedTotal uint64
+	if ackedTotal+failedObserved < submittedTotal {
+		unconfirmedTotal = submittedTotal - (ackedTotal + failedObserved)
 	}
+	failedFinal := failedObserved + unconfirmedTotal
 
 	summary := &Summary{
 		RunID:        p.cfg.RunID,
 		Submitted:    submittedTotal,
 		Acknowledged: ackedTotal,
-		Failed:       failedTotal,
+		Failed:       failedFinal,
 		GenElapsed:   genElapsed,
 		DrainElapsed: drainElapsed,
 		TotalElapsed: totalElapsed,

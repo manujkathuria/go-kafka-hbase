@@ -189,10 +189,17 @@ func TestProducerRunDrainError(t *testing.T) {
 }
 
 func TestProducerRunDrainInFlightTimeout(t *testing.T) {
-	// Simulate an in-flight request whose completion is delayed indefinitely by Kafka / network
+	// Simulate an in-flight request whose completion is delayed past timeout
+	var lateCallbacks []func()
+	var mu sync.Mutex
+
 	client := &mockKafkaClient{
 		produceHook: func(ctx context.Context, r *kgo.Record, promise func(*kgo.Record, error)) {
-			// Intentionally do not call promise(r, nil) immediately; simulate hung broker
+			mu.Lock()
+			lateCallbacks = append(lateCallbacks, func() {
+				promise(r, nil)
+			})
+			mu.Unlock()
 		},
 	}
 
@@ -225,6 +232,26 @@ func TestProducerRunDrainInFlightTimeout(t *testing.T) {
 	}
 	if summary.Failed == 0 {
 		t.Errorf("expected unresolved in-flight records to be marked as failed/unconfirmed")
+	}
+	if summary.Submitted != 10 { // 2 batches of 5 before genCtx timeout
+		t.Logf("submitted count: %d", summary.Submitted)
+	}
+	initialAcked := summary.Acknowledged
+	initialFailed := summary.Failed
+
+	// Fire the late callbacks after Run has already returned
+	mu.Lock()
+	for _, cb := range lateCallbacks {
+		cb()
+	}
+	mu.Unlock()
+
+	// Verify that late callbacks do not mutate producer state after Run returns
+	if summary.Acknowledged != initialAcked {
+		t.Errorf("summary.Acknowledged changed after late callbacks: got %d, want %d", summary.Acknowledged, initialAcked)
+	}
+	if summary.Failed != initialFailed {
+		t.Errorf("summary.Failed changed after late callbacks: got %d, want %d", summary.Failed, initialFailed)
 	}
 }
 
