@@ -126,8 +126,21 @@ func New(cfg Config, client KafkaClient, logger *slog.Logger) (*Producer, error)
 	}, nil
 }
 
+// batchSlot holds the storage and completion tracking for an in-flight batch.
+// Because the underlying Kafka client retains record byte references until the produce
+// promise callback executes, a batchSlot's buffer must NOT be overwritten or reused
+// until all in-flight callbacks have completed.
+type batchSlot struct {
+	buf     []byte
+	records []kgo.Record
+	wg      sync.WaitGroup
+	active  bool
+	done    chan struct{}
+}
+
 // Run executes the generation loop until ctx is canceled (or duration expires),
-// then performs a bounded drain. Returns Summary and any terminal error.
+// then performs a bounded drain.
+// Total shutdown and cleanup time is strictly bounded by DrainTimeout.
 func (p *Producer) Run(ctx context.Context) (*Summary, error) {
 	genCtx, genCancel := context.WithTimeout(ctx, p.cfg.Duration)
 	defer genCancel()
@@ -142,17 +155,24 @@ func (p *Producer) Run(ctx context.Context) (*Summary, error) {
 	genStart := time.Now()
 	var runErr error
 
-	// We use reusable bounded batch buffers.
-	// To preserve memory safety across asynchronous Franz-go completion:
-	// Franz-go retains key and value byte slices until the produce promise callback is invoked.
-	// Therefore, each in-flight batch must keep its memory valid until all records in that batch complete.
-	// A synchronous batch loop (wait for batch acknowledgements before reusing the batch buffer)
-	// gives bounded memory, backpressure from Kafka, and simple, completely safe ownership.
 	encodedRecordSize := RecordHeaderSize + FixedPayloadSize
-	batchBuffer := make([]byte, p.cfg.BatchSize*encodedRecordSize)
-	records := make([]kgo.Record, p.cfg.BatchSize)
+	// Double buffering: 2 batch slots.
+	// Slot i is populated and submitted. Before reusing slot i on a subsequent iteration,
+	// we wait for slot i's previous completion. This bounds memory to 2 batches
+	// while allowing safe pipelined generation and strict ownership isolation.
+	slots := [2]batchSlot{
+		{
+			buf:     make([]byte, p.cfg.BatchSize*encodedRecordSize),
+			records: make([]kgo.Record, p.cfg.BatchSize),
+		},
+		{
+			buf:     make([]byte, p.cfg.BatchSize*encodedRecordSize),
+			records: make([]kgo.Record, p.cfg.BatchSize),
+		},
+	}
 
 	var seq uint64
+	slotIdx := 0
 
 loop:
 	for {
@@ -162,9 +182,22 @@ loop:
 		default:
 		}
 
-		// Prepare a batch
+		slot := &slots[slotIdx]
+		// If this slot was previously submitted, wait for its completion before reusing its buffer.
+		// Crucial: this wait MUST respect genCtx. If Kafka stalls or stops completing writes,
+		// we must not hang forever here—we must exit generation and enter bounded drain.
+		if slot.active {
+			select {
+			case <-slot.done:
+				slot.active = false
+			case <-genCtx.Done():
+				// Generation canceled or deadline expired while waiting for slot reuse
+				break loop
+			}
+		}
+
+		// Prepare batch
 		batchCount := 0
-		var wg sync.WaitGroup
 		var batchFailed atomic.Bool
 
 		for i := 0; i < p.cfg.BatchSize; i++ {
@@ -172,7 +205,7 @@ loop:
 				break
 			}
 			offset := i * encodedRecordSize
-			recordBuf := batchBuffer[offset : offset+encodedRecordSize]
+			recordBuf := slot.buf[offset : offset+encodedRecordSize]
 
 			var synRec SyntheticRecord
 			synRec.FillDeterministicPayload(p.cfg.RunID, seq)
@@ -182,7 +215,7 @@ loop:
 			}
 
 			key := KeyForSeq(seq)
-			records[i] = kgo.Record{
+			slot.records[i] = kgo.Record{
 				Key:   key,
 				Value: recordBuf,
 				Topic: p.cfg.Topic,
@@ -196,30 +229,38 @@ loop:
 			break loop
 		}
 
-		// Publish the batch
-		wg.Add(batchCount)
+		// Submit batch to Kafka
+		slot.wg.Add(batchCount)
+		slot.done = make(chan struct{})
+		slot.active = true
+
+		// Spawn a single waiter to close slot.done when this batch finishes
+		go func(s *batchSlot) {
+			s.wg.Wait()
+			close(s.done)
+		}(slot)
+
 		for i := 0; i < batchCount; i++ {
-			rec := &records[i]
+			rec := &slot.records[i]
 			p.submitted.Add(1)
 
-			p.client.Produce(genCtx, rec, func(r *kgo.Record, err error) {
-				defer wg.Done()
+			// Use background context for delivery so submitted writes can complete during drain.
+			// Drain enforces its own bounded timeout (p.cfg.DrainTimeout) over in-flight writes and Flush.
+			p.client.Produce(context.Background(), rec, func(r *kgo.Record, err error) {
+				defer slot.wg.Done()
 				if err != nil {
 					p.failed.Add(1)
 					batchFailed.Store(true)
-					// Avoid hot-path logging every single error; log if needed
 				} else {
 					p.acked.Add(1)
 				}
 			})
 		}
 
-		// Synchronously wait for batch completion before reusing batchBuffer.
-		// If genCtx is canceled while waiting, the wait still needs to complete or bound cleanup.
-		wg.Wait()
+		// Advance to next slot for double buffering
+		slotIdx = (slotIdx + 1) % len(slots)
 
 		if batchFailed.Load() && genCtx.Err() == nil {
-			// Publication failure during generation
 			runErr = errors.New("producer: batch publication failed")
 			break loop
 		}
@@ -227,23 +268,54 @@ loop:
 
 	genElapsed := time.Since(genStart)
 
-	// Bounded Drain using a fresh context
-	p.logger.Info("generation finished, starting drain", "drain_timeout", p.cfg.DrainTimeout)
+	// Bounded Drain & Cleanup Phase:
+	// A broker freeze or network partition can leave in-flight writes unresolved.
+	// Bounded shutdown must enforce DrainTimeout over the ENTIRE drain phase,
+	// including in-flight completions and Flush.
+	p.logger.Info("generation finished, starting bounded drain", "drain_timeout", p.cfg.DrainTimeout)
 	drainStart := time.Now()
 
 	drainCtx, drainCancel := context.WithTimeout(context.Background(), p.cfg.DrainTimeout)
 	defer drainCancel()
 
-	drainErr := p.client.Flush(drainCtx)
-	drainElapsed := time.Since(drainStart)
+	// Wait for all active batch slots to complete or until drainCtx expires
+	slotsDone := make(chan struct{})
+	go func() {
+		for i := range slots {
+			if slots[i].active {
+				<-slots[i].done
+			}
+		}
+		close(slotsDone)
+	}()
 
+	var drainErr error
+	select {
+	case <-slotsDone:
+		// In-flight batch callbacks completed, now flush any remaining client buffers
+		drainErr = p.client.Flush(drainCtx)
+	case <-drainCtx.Done():
+		drainErr = fmt.Errorf("producer: drain timed out waiting for in-flight completions: %w", drainCtx.Err())
+	}
+
+	drainElapsed := time.Since(drainStart)
 	totalElapsed := time.Since(genStart)
+
+	submittedTotal := p.submitted.Load()
+	ackedTotal := p.acked.Load()
+	failedTotal := p.failed.Load()
+	// Unconfirmed writes are those submitted but neither explicitly acknowledged nor failed
+	if ackedTotal+failedTotal < submittedTotal {
+		unconfirmed := submittedTotal - (ackedTotal + failedTotal)
+		p.failed.Add(unconfirmed)
+		failedTotal = p.failed.Load()
+	}
 
 	summary := &Summary{
 		RunID:        p.cfg.RunID,
-		Submitted:    p.submitted.Load(),
-		Acknowledged: p.acked.Load(),
-		Failed:       p.failed.Load(),
+		Submitted:    submittedTotal,
+		Acknowledged: ackedTotal,
+		Failed:       failedTotal,
 		GenElapsed:   genElapsed,
 		DrainElapsed: drainElapsed,
 		TotalElapsed: totalElapsed,

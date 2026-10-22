@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -184,6 +185,46 @@ func TestProducerRunDrainError(t *testing.T) {
 	}
 	if summary == nil {
 		t.Fatalf("expected non-nil summary even on drain error")
+	}
+}
+
+func TestProducerRunDrainInFlightTimeout(t *testing.T) {
+	// Simulate an in-flight request whose completion is delayed indefinitely by Kafka / network
+	client := &mockKafkaClient{
+		produceHook: func(ctx context.Context, r *kgo.Record, promise func(*kgo.Record, error)) {
+			// Intentionally do not call promise(r, nil) immediately; simulate hung broker
+		},
+	}
+
+	cfg := producer.Config{
+		Brokers:      []string{"localhost:9092"},
+		Topic:        "test.topic",
+		Duration:     20 * time.Millisecond,
+		DrainTimeout: 50 * time.Millisecond,
+		BatchSize:    5,
+	}
+
+	p, err := producer.New(cfg, client, nil)
+	if err != nil {
+		t.Fatalf("unexpected New error: %v", err)
+	}
+
+	start := time.Now()
+	summary, err := p.Run(context.Background())
+	elapsed := time.Since(start)
+
+	if err == nil {
+		t.Fatalf("expected error due to drain timeout with in-flight write, got nil")
+	}
+	if !strings.Contains(err.Error(), "drain timed out") {
+		t.Fatalf("expected error containing 'drain timed out', got: %v", err)
+	}
+	// Verify that shutdown bounded strictly and did not hang indefinitely
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("shutdown took too long: %v (expected ~70ms)", elapsed)
+	}
+	if summary.Failed == 0 {
+		t.Errorf("expected unresolved in-flight records to be marked as failed/unconfirmed")
 	}
 }
 
